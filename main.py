@@ -1,17 +1,47 @@
 import os
 import json
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.stories import (
+    GetPeerStoriesRequest,
+    GetPinnedStoriesRequest
+)
 
-API_ID = 32492582
-API_HASH = "..."
+
+# =========================================================
+# إعدادات Telegram
+# =========================================================
+
+API_ID = int(os.getenv("API_ID", "32492582"))
+API_HASH = os.getenv("API_HASH")
 
 SESSION = os.getenv("SESSION")
 
+if not API_HASH:
+    raise RuntimeError("❌ API_HASH غير موجود في Railway Variables")
+
 if not SESSION:
-    raise RuntimeError("SESSION غير موجود في Railway Variables")
+    raise RuntimeError("❌ SESSION غير موجود في Railway Variables")
+
+# تنظيف الـ Session من المسافات والأسطر الزائدة
+SESSION = "".join(SESSION.split())
+
+# إزالة علامات الاقتباس إذا تم نسخها بالخطأ
+if len(SESSION) >= 2:
+    if (
+        (SESSION[0] == '"' and SESSION[-1] == '"')
+        or
+        (SESSION[0] == "'" and SESSION[-1] == "'")
+    ):
+        SESSION = SESSION[1:-1]
+
+if not SESSION:
+    raise RuntimeError("❌ SESSION فارغة")
+
 
 client = TelegramClient(
     StringSession(SESSION),
@@ -19,7 +49,13 @@ client = TelegramClient(
     API_HASH
 )
 
+
+# =========================================================
+# الملفات والذاكرة
+# =========================================================
+
 BANNED_FILE = "banned.json"
+
 auto_save_users = set()
 media_cache = {}
 message_info_cache = {}
@@ -27,484 +63,1374 @@ visited_users_cache = set()
 pending_stories = {}
 
 DOWNLOAD_DIR = "downloads"
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# قفل لمنع تعارض عمليات حفظ banned.json
+banned_save_lock = asyncio.Lock()
+
+
+# =========================================================
+# المحظورين
+# =========================================================
 
 def load_banned_users():
-    if os.path.exists(BANNED_FILE):
-        try:
-            with open(BANNED_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
+    if not os.path.exists(BANNED_FILE):
+        return set()
+
+    try:
+        with open(BANNED_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+
+    except Exception as e:
+        print(f"خطأ في قراءة ملف المحظورين: {e}")
+        return set()
+
 
 def save_banned_users():
     try:
-        with open(BANNED_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(banned_users), f)
+        # كتابة مؤقتة ثم استبدال الملف
+        temp_file = BANNED_FILE + ".tmp"
+
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(
+                list(banned_users),
+                f,
+                ensure_ascii=False
+            )
+
+        os.replace(temp_file, BANNED_FILE)
+
     except Exception as e:
         print(f"خطأ في حفظ ملف المحظورين: {e}")
 
+
+async def async_save_banned_users():
+    """
+    حفظ banned.json بالخلفية حتى لا يتأخر أمر /ban أو /unban.
+    """
+    async with banned_save_lock:
+        try:
+            await asyncio.to_thread(
+                save_banned_users
+            )
+        except Exception as e:
+            print(
+                f"خطأ في الحفظ بالخلفية: {e}"
+            )
+
+
 banned_users = load_banned_users()
 
+
+# =========================================================
+# تنظيف الكاش
+# =========================================================
+
 def clean_caches():
+
     if len(media_cache) > 100:
-        sorted_keys = sorted(media_cache.keys())
-        for key in sorted_keys[:50]:
+
+        keys = list(media_cache.keys())
+
+        for key in keys[:50]:
             del media_cache[key]
+
     if len(message_info_cache) > 100:
-        sorted_keys = sorted(message_info_cache.keys())
-        for key in sorted_keys[:50]:
+
+        keys = list(message_info_cache.keys())
+
+        for key in keys[:50]:
             del message_info_cache[key]
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^/help$'))
+
+# =========================================================
+# /help
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/help$"
+    )
+)
 async def help_command_handler(event):
+
     if not event.is_private:
         return
+
     try:
         await event.delete()
     except Exception:
         pass
-    
+
     help_text = (
         "🤖 **قائمة أوامر اليوزر بوت:**\n\n"
-        "🔍 `/done [المعرف/الآيدي]` - لفحص وتحميل قصص الحساب.\n"
-        "🚫 `/ban` - (بالرد على رسالة شخص) لحظره ومنع رسائله بصمت.\n"
-        "✅ `/unban` - (بالرد على شخص) لإلغاء حظره بصمت.\n"
-        "📋 `/banned` - لعرض قائمة المحظورين (الآيدي والمعرف).\n"
-        "📥 `/save` - (بالرد على شخص) لتفعيل/إلغاء الحفظ التلقائي لوسائطه.\n"
-        "7️⃣ أو 8️⃣ - (بالرد على أي ميديا) لتحميلها مباشرة (هنا أو في المحفوظات).\n"
-        "❓ `/help` - لعرض هذه القائمة."
-    )
-    await client.send_message(event.chat_id, help_text)
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^/banned$'))
+        "🔍 `/done [المعرف/الآيدي]`\n"
+        "لفحص القصص النشطة والهايلايت.\n\n"
+
+        "🚫 `/ban`\n"
+        "بالرد على رسالة شخص لحظره.\n\n"
+
+        "✅ `/unban`\n"
+        "بالرد على شخص لإلغاء الحظر.\n\n"
+
+        "📋 `/banned`\n"
+        "عرض قائمة المحظورين.\n\n"
+
+        "📥 `/save`\n"
+        "بالرد على شخص لتفعيل/إلغاء الحفظ التلقائي.\n\n"
+
+        "7️⃣ بالرد على ميديا\n"
+        "تحميلها داخل المحادثة.\n\n"
+
+        "8️⃣ بالرد على ميديا\n"
+        "إرسالها إلى الرسائل المحفوظة.\n"
+    )
+
+    await client.send_message(
+        event.chat_id,
+        help_text
+    )
+
+
+# =========================================================
+# /banned
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/banned$"
+    )
+)
 async def list_banned_handler(event):
+
     if not event.is_private:
         return
-    
+
     try:
         await event.delete()
     except Exception:
         pass
-    
+
     if not banned_users:
-        await client.send_message(event.chat_id, "📭 قائمة المحظورين فارغة حالياً.")
+
+        await client.send_message(
+            event.chat_id,
+            "📭 قائمة المحظورين فارغة حالياً."
+        )
+
         return
 
-    status_msg = await event.respond("🔍 جاري جلب معلومات المحظورين...")
+    status_msg = await event.respond(
+        "🔍 جاري جلب معلومات المحظورين..."
+    )
 
     banned_details = []
+
     for uid in banned_users:
+
         username_str = "لا يوجد معرف"
+
         try:
+
             entity = await client.get_entity(uid)
-            if entity and hasattr(entity, 'username') and entity.username:
+
+            if getattr(entity, "username", None):
+
                 username_str = f"@{entity.username}"
-            elif entity and hasattr(entity, 'first_name') and entity.first_name:
+
+            elif getattr(entity, "first_name", None):
+
                 username_str = entity.first_name
+
         except Exception:
             pass
-        banned_details.append(f"• الآيدي: `{uid}` | المعرف: {username_str}")
+
+        banned_details.append(
+            f"• الآيدي: `{uid}` | المعرف: {username_str}"
+        )
 
     banned_list_str = "\n".join(banned_details)
-    await status_msg.edit(f"🚫 **قائمة المحظورين حالياً:**\n\n{banned_list_str}")
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^/ban$'))
+    await status_msg.edit(
+        f"🚫 **قائمة المحظورين حالياً:**\n\n"
+        f"{banned_list_str}"
+    )
+
+
+# =========================================================
+# /ban — سريع
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/ban$"
+    )
+)
 async def ban_user_handler(event):
+
     if not event.is_private:
         return
-    client.loop.create_task(event.delete())
-    reply_msg = await event.get_reply_message()
-    if reply_msg:
-        banned_users.add(reply_msg.sender_id)
-        save_banned_users()
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^/unban$'))
-async def unban_user_handler(event):
-    if not event.is_private:
-        return
-    client.loop.create_task(event.delete())
+    # نحصل على الرسالة أولاً
     reply_msg = await event.get_reply_message()
-    if reply_msg:
-        if reply_msg.sender_id in banned_users:
-            banned_users.remove(reply_msg.sender_id)
-            save_banned_users()
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^/save$'))
-async def auto_save_handler(event):
-    if not event.is_private:
-        return
-    client.loop.create_task(event.delete())
-    reply_msg = await event.get_reply_message()
-    if reply_msg:
-        sender_id = reply_msg.sender_id
-        if sender_id in auto_save_users:
-            auto_save_users.remove(sender_id)
-            await client.send_message(event.chat_id, f"🔴 تم إلغاء الحفظ التلقائي للمستخدم (`{sender_id}`).")
-        else:
-            auto_save_users.add(sender_id)
-            await client.send_message(event.chat_id, f"🟢 تم تفعيل الحفظ التلقائي للمستخدم (`{sender_id}`).")
-
-@client.on(events.NewMessage(outgoing=True, pattern=r'^/done\s+(.+)'))
-async def check_stories_handler(event):
-    target = event.pattern_match.group(1).strip()
-    
+    # حذف الأمر
     try:
         await event.delete()
     except Exception:
         pass
 
-    status_msg = await event.respond(f"🔍 جاري فحص القصص للحساب: `{target}`...")
+    if not reply_msg:
+        return
+
+    sender_id = reply_msg.sender_id
+
+    if not sender_id:
+        return
+
+    # إضافة فورية للذاكرة
+    banned_users.add(sender_id)
+
+    # الحفظ بالخلفية
+    asyncio.create_task(
+        async_save_banned_users()
+    )
+
+
+# =========================================================
+# /unban — سريع
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/unban$"
+    )
+)
+async def unban_user_handler(event):
+
+    if not event.is_private:
+        return
+
+    # الحصول على الرسالة قبل حذف الأمر
+    reply_msg = await event.get_reply_message()
 
     try:
-        if target.isdigit():
-            user = await client.get_entity(int(target))
-        else:
-            user = await client.get_entity(target)
+        await event.delete()
+    except Exception:
+        pass
 
-        active_stories = []
-        highlighted_stories = []
+    if not reply_msg:
+        return
 
-        try:
-            peer_stories = await client(GetPeerStoriesRequest(peer=user))
-            if peer_stories and hasattr(peer_stories, 'stories'):
-                if hasattr(peer_stories.stories, 'stories'):
-                    active_stories.extend(peer_stories.stories.stories)
-        except Exception as e:
-            print(f"خطأ في جلب القصص النشطة: {e}")
+    sender_id = reply_msg.sender_id
 
-        try:
-            pinned_res = await client(GetPinnedStoriesRequest(peer=user, offset_id=0, limit=100))
-            if pinned_res and hasattr(pinned_res, 'stories'):
-                for s in pinned_res.stories:
-                    if s not in active_stories and s not in highlighted_stories:
-                        highlighted_stories.append(s)
-        except Exception as e:
-            print(f"خطأ في جلب القصص البارزة: {e}")
+    if not sender_id:
+        return
 
-        total_active = len(active_stories)
-        total_highlighted = len(highlighted_stories)
-        total_all = total_active + total_highlighted
+    # إزالة فورية من الذاكرة
+    banned_users.discard(sender_id)
 
-        if total_all > 0:
-            pending_stories[event.chat_id] = {
-                "step": "select_type",
-                "active": active_stories,
-                "highlighted": highlighted_stories,
-                "target": target
-            }
+    # الحفظ بالخلفية
+    asyncio.create_task(
+        async_save_banned_users()
+    )
 
-            text_report = (
-                f"✅ تم فحص الحساب `{target}` بنجاح:\n"
-                f"🟢 **قصص نشطة حالية:** {total_active}\n"
-                f"⭐ **قصص بارزة/أرشيف:** {total_highlighted}\n"
-                f"📊 **المجموع الكلي:** {total_all}\n\n"
-                f"ما الذي ترغب في تحميله؟\n"
-                f"1️⃣ **القصص النشطة فقط**\n"
-                f"2️⃣ **القصص البارزة/الأرشيف فقط**\n"
-                f"3️⃣ **الاثنين معاً**\n"
-                f"(قم بالرد على هذه الرسالة برقم الخيار المطلوب)."
+
+# =========================================================
+# /save
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/save$"
+    )
+)
+async def auto_save_handler(event):
+
+    if not event.is_private:
+        return
+
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    reply_msg = await event.get_reply_message()
+
+    if not reply_msg:
+        return
+
+    sender_id = reply_msg.sender_id
+
+    if sender_id in auto_save_users:
+
+        auto_save_users.remove(sender_id)
+
+        await client.send_message(
+            event.chat_id,
+            f"🔴 تم إلغاء الحفظ التلقائي للمستخدم `{sender_id}`."
+        )
+
+    else:
+
+        auto_save_users.add(sender_id)
+
+        await client.send_message(
+            event.chat_id,
+            f"🟢 تم تفعيل الحفظ التلقائي للمستخدم `{sender_id}`."
+        )
+
+
+# =========================================================
+# جلب القصص النشطة
+# =========================================================
+
+async def get_active_stories(user):
+
+    stories = []
+
+    try:
+
+        result = await client(
+            GetPeerStoriesRequest(
+                peer=user
             )
-            await status_msg.edit(text_report)
-        else:
-            await status_msg.edit(f"❌ لا توجد أي قصص نشطة أو بارزة ظاهرة للحساب `{target}`.")
+        )
+
+        if result and hasattr(result, "stories"):
+
+            peer_stories = result.stories
+
+            if peer_stories and hasattr(
+                peer_stories,
+                "stories"
+            ):
+
+                stories.extend(
+                    peer_stories.stories
+                )
 
     except Exception as e:
-        await status_msg.edit(f"⚠️ حدث خطأ أثناء فحص الحساب: {e}")
 
-@client.on(events.NewMessage(outgoing=True))
+        print(
+            f"خطأ في جلب القصص النشطة: {e}"
+        )
+
+    return stories
+
+
+# =========================================================
+# جلب الهايلايت
+# =========================================================
+
+async def get_highlight_stories(user):
+
+    stories = []
+
+    try:
+
+        result = await client(
+            GetPinnedStoriesRequest(
+                peer=user,
+                offset_id=0,
+                limit=100
+            )
+        )
+
+        if result and hasattr(
+            result,
+            "stories"
+        ):
+
+            for story in result.stories:
+
+                if story not in stories:
+                    stories.append(story)
+
+    except Exception as e:
+
+        print(
+            f"خطأ في جلب الهايلايت: {e}"
+        )
+
+    return stories
+
+
+# =========================================================
+# /done
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/done\s+(.+)"
+    )
+)
+async def check_stories_handler(event):
+
+    target = event.pattern_match.group(1).strip()
+
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    status_msg = await event.respond(
+        f"🔍 جاري فحص القصص للحساب:\n"
+        f"`{target}` ..."
+    )
+
+    try:
+
+        # جلب الحساب
+        if target.isdigit():
+
+            user = await client.get_entity(
+                int(target)
+            )
+
+        else:
+
+            user = await client.get_entity(
+                target
+            )
+
+        # القصص النشطة
+        active_stories = await get_active_stories(
+            user
+        )
+
+        # الهايلايت
+        highlighted_stories = await get_highlight_stories(
+            user
+        )
+
+        # إزالة التكرار
+        active_ids = {
+            getattr(s, "id", None)
+            for s in active_stories
+        }
+
+        highlighted_stories = [
+            s
+            for s in highlighted_stories
+            if getattr(s, "id", None)
+            not in active_ids
+        ]
+
+        total_active = len(active_stories)
+
+        total_highlighted = len(
+            highlighted_stories
+        )
+
+        total_all = (
+            total_active +
+            total_highlighted
+        )
+
+        # لا توجد قصص
+        if total_all == 0:
+
+            await status_msg.edit(
+                f"❌ لا توجد قصص نشطة أو "
+                f"هايلايت ظاهرة للحساب "
+                f"`{target}`."
+            )
+
+            return
+
+        # حفظ العملية
+        pending_stories[event.chat_id] = {
+
+            "step": "select_type",
+
+            "active": active_stories,
+
+            "highlighted": highlighted_stories,
+
+            "target": target,
+
+            "status_msg_id": status_msg.id
+        }
+
+        # النوعين موجودين
+        if total_active > 0 and total_highlighted > 0:
+
+            text_report = (
+                f"✅ **تم فحص الحساب بنجاح**\n\n"
+
+                f"👤 الحساب: `{target}`\n\n"
+
+                f"🟢 القصص النشطة: "
+                f"**{total_active}**\n"
+
+                f"⭐ الهايلايت: "
+                f"**{total_highlighted}**\n\n"
+
+                f"📊 المجموع: "
+                f"**{total_all}**\n\n"
+
+                f"━━━━━━━━━━━━━━\n"
+
+                f"📥 ماذا تريد تحميله؟\n\n"
+
+                f"1️⃣ **القصص النشطة فقط**\n"
+
+                f"2️⃣ **الهايلايت فقط**\n"
+
+                f"3️⃣ **الاثنين معاً**\n\n"
+
+                f"📌 قم بالرد على هذه الرسالة بالرقم."
+            )
+
+        # النشطة فقط
+        elif total_active > 0:
+
+            text_report = (
+                f"✅ **تم فحص الحساب بنجاح**\n\n"
+
+                f"👤 الحساب: `{target}`\n\n"
+
+                f"🟢 القصص النشطة: "
+                f"**{total_active}**\n\n"
+
+                f"⭐ الهايلايت: **0**\n\n"
+
+                f"📥 يوجد نوع واحد فقط:\n\n"
+
+                f"1️⃣ **تحميل القصص النشطة**\n\n"
+
+                f"📌 قم بالرد بـ `1`."
+            )
+
+        # الهايلايت فقط
+        else:
+
+            text_report = (
+                f"✅ **تم فحص الحساب بنجاح**\n\n"
+
+                f"👤 الحساب: `{target}`\n\n"
+
+                f"🟢 القصص النشطة: **0**\n\n"
+
+                f"⭐ الهايلايت: "
+                f"**{total_highlighted}**\n\n"
+
+                f"📥 يوجد نوع واحد فقط:\n\n"
+
+                f"1️⃣ **تحميل الهايلايت**\n\n"
+
+                f"📌 قم بالرد بـ `1`."
+            )
+
+        await status_msg.edit(
+            text_report
+        )
+
+    except Exception as e:
+
+        await status_msg.edit(
+            f"⚠️ حدث خطأ أثناء فحص الحساب:\n\n"
+            f"`{type(e).__name__}: {e}`"
+        )
+
+
+# =========================================================
+# الردود الخاصة بالقصص
+# =========================================================
+
+@client.on(
+    events.NewMessage(outgoing=True)
+)
 async def handle_user_replies(event):
+
     if not event.is_private and not event.is_group:
         return
-    
+
     reply_msg = await event.get_reply_message()
+
     if not reply_msg:
         return
 
     chat_id = event.chat_id
-    if chat_id in pending_stories:
-        text = event.raw_text.strip().lower()
-        data = pending_stories[chat_id]
-        current_step = data.get("step")
 
-        if current_step == "select_type":
-            if text in ['1', 'نشطة', 'القصص النشطة']:
-                selected_types = [("🟢 [قصة نشطة]", data["active"])]
-                selected_types = [x for x in selected_types if len(x[1]) > 0]
-            elif text in ['2', 'بارزة', 'أرشيف', 'القصص البارزة', 'الأرشيف']:
-                selected_types = [("⭐ [قصة بارزة/أرشيف]", data["highlighted"])]
-                selected_types = [x for x in selected_types if len(x[1]) > 0]
-            elif text in ['3', 'الاثنين', 'الاثنين معاً', 'الكل']:
-                selected_types = []
-                if len(data["active"]) > 0:
-                    selected_types.append(("🟢 [قصة نشطة]", data["active"]))
-                if len(data["highlighted"]) > 0:
-                    selected_types.append(("⭐ [قصة بارزة/أرشيف]", data["highlighted"]))
+    if chat_id not in pending_stories:
+        return
+
+    data = pending_stories[chat_id]
+
+    text = event.raw_text.strip().lower()
+
+    current_step = data.get("step")
+
+
+    # =====================================================
+    # اختيار نوع القصص
+    # =====================================================
+
+    if current_step == "select_type":
+
+        # يجب أن يكون الرد على رسالة نتيجة الفحص
+        if reply_msg.id != data.get("status_msg_id"):
+            return
+
+        active = data["active"]
+
+        highlighted = data["highlighted"]
+
+        selected_types = []
+
+
+        # النوعان موجودان
+        if active and highlighted:
+
+            if text in [
+                "1",
+                "نشطة",
+                "القصص النشطة"
+            ]:
+
+                selected_types = [
+                    (
+                        "🟢 [قصة نشطة]",
+                        active
+                    )
+                ]
+
+            elif text in [
+                "2",
+                "هايلايت",
+                "بارزة",
+                "أرشيف",
+                "القصص البارزة",
+                "الأرشيف"
+            ]:
+
+                selected_types = [
+                    (
+                        "⭐ [هايلايت]",
+                        highlighted
+                    )
+                ]
+
+            elif text in [
+                "3",
+                "الكل",
+                "الاثنين",
+                "الاثنين معا",
+                "الاثنين معاً"
+            ]:
+
+                selected_types = [
+                    (
+                        "🟢 [قصة نشطة]",
+                        active
+                    ),
+                    (
+                        "⭐ [هايلايت]",
+                        highlighted
+                    )
+                ]
+
             else:
                 return
 
-            if not selected_types:
-                await event.respond("❌ النوع الذي اخترته لا يحتوي على أي قصص. تم إلغاء العملية.")
-                del pending_stories[chat_id]
-                try:
-                    await client.delete_messages(chat_id, [event.id, reply_msg.id])
-                except Exception:
-                    pass
+
+        # النشطة فقط
+        elif active:
+
+            if text not in [
+                "1",
+                "نشطة",
+                "القصص النشطة"
+            ]:
                 return
 
-            data["selected_types"] = selected_types
-            data["step"] = "select_destination"
+            selected_types = [
+                (
+                    "🟢 [قصة نشطة]",
+                    active
+                )
+            ]
+
+
+        # الهايلايت فقط
+        elif highlighted:
+
+            if text not in [
+                "1",
+                "هايلايت",
+                "بارزة",
+                "أرشيف",
+                "القصص البارزة",
+                "الأرشيف"
+            ]:
+                return
+
+            selected_types = [
+                (
+                    "⭐ [هايلايت]",
+                    highlighted
+                )
+            ]
+
+
+        if not selected_types:
+            return
+
+
+        data["selected_types"] = selected_types
+
+        data["step"] = "select_destination"
+
+
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
+
+        destination_msg = await client.send_message(
+            chat_id,
+
+            "📂 **تم اختيار القصص بنجاح!**\n\n"
+
+            "أين تريد إرسالها؟\n\n"
+
+            "1️⃣ **المحفوظات**\n"
+            "إرسالها إلى الرسائل المحفوظة.\n\n"
+
+            "2️⃣ **هنا**\n"
+            "إرسالها في هذه المحادثة.\n\n"
+
+            "3️⃣ **إلغاء**\n\n"
+
+            "📌 قم بالرد على هذه الرسالة بالرقم."
+        )
+
+
+        data["destination_msg_id"] = (
+            destination_msg.id
+        )
+
+        return
+
+
+    # =====================================================
+    # اختيار مكان التنزيل
+    # =====================================================
+
+    if current_step == "select_destination":
+
+        if reply_msg.id != data.get(
+            "destination_msg_id"
+        ):
+            return
+
+
+        if text in [
+            "1",
+            "محفوظة",
+            "المحفوظة",
+            "مفصول"
+        ]:
+
+            destination = "me"
+
+            dest_name = "الرسائل المحفوظة"
+
+
+        elif text in [
+            "2",
+            "هنا"
+        ]:
+
+            destination = event.chat_id
+
+            dest_name = "هذه المحادثة"
+
+
+        elif text in [
+            "3",
+            "لا",
+            "الغاء",
+            "إلغاء",
+            "no"
+        ]:
+
+            del pending_stories[chat_id]
 
             try:
-                await client.delete_messages(chat_id, [event.id, reply_msg.id])
+                await event.delete()
             except Exception:
                 pass
 
             await client.send_message(
                 chat_id,
-                f"📂 ممتاز! أين تريد تنزيل القصص المختارة؟\n\n"
-                f"1️⃣ أرسل **مفصول** أو **محفوظة** (للرسائل المحفوظة)\n"
-                f"2️⃣ أرسل **هنا** (في هذه المحادثة أو القروب)\n"
-                f"3️⃣ أرسل **لا** للإلغاء\n"
-                f"(قم بالرد على هذه الرسالة بالخيار المطلوب)."
+                "❌ تم إلغاء عملية تحميل القصص."
             )
+
             return
 
-        elif current_step == "select_destination":
-            if text in ['محفوظة', 'المحفوظة', '1', 'مفصول']:
-                destination = 'me'
-                dest_name = "الرسائل المحفوظة"
-            elif text in ['هنا', '2']:
-                destination = event.chat_id
-                dest_name = "هذه المحادثة/القروب"
-            elif text in ['لا', 'no', '3']:
-                del pending_stories[chat_id]
+        else:
+            return
+
+
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
+
+        selected_types = data[
+            "selected_types"
+        ]
+
+        target_name = data[
+            "target"
+        ]
+
+
+        total_count = sum(
+            len(stories)
+            for _, stories in selected_types
+        )
+
+        current_index = 0
+
+        success_count = 0
+
+
+        counter_msg = await client.send_message(
+            chat_id,
+
+            f"📥 **جاري بدء التحميل...**\n\n"
+            f"⏳ 0 / {total_count}\n"
+            f"📂 الوجهة: {dest_name}"
+        )
+
+
+        # تحميل القصص
+        for label, stories in selected_types:
+
+            for story in stories:
+
+                current_index += 1
+
                 try:
-                    await client.delete_messages(chat_id, [event.id, reply_msg.id])
-                except Exception:
-                    pass
-                return
-            else:
-                return
 
-            try:
-                await client.delete_messages(chat_id, [event.id, reply_msg.id])
-            except Exception:
-                pass
+                    if not getattr(
+                        story,
+                        "media",
+                        None
+                    ):
+                        continue
 
-            selected_types = data["selected_types"]
-            target_name = data["target"]
 
-            total_count = sum(len(s_list) for _, s_list in selected_types)
-            current_index = 0
-            success_count = 0
+                    last_pct = -1
 
-            counter_msg = await client.send_message(chat_id, f"📥 جاري بدء التنزيل السريع...\n⏳ تم تحميل (0 / {total_count})")
 
-            for label, s_list in selected_types:
-                for story in s_list:
-                    current_index += 1
-                    try:
-                        if hasattr(story, 'media') and story.media:
-                            
-                            last_pct = [-1]
-                            async def fast_progress(current, total):
-                                if total > 0:
-                                    pct = int((current / total) * 100)
-                                    if pct >= last_pct[0] + 25 or pct == 100:
-                                        last_pct[0] = pct
-                                        try:
-                                            await counter_msg.edit(
-                                                f"📥 جاري التنزيل إلى {dest_name}...\n"
-                                                f"⏳ القصة ({current_index} / {total_count})\n"
-                                                f"📊 نسبة التحميل: `{pct}%`"
-                                            )
-                                        except Exception:
-                                            pass
+                    async def progress_callback(
+                        current,
+                        total
+                    ):
 
-                            file_path = await client.download_media(
-                                story.media, 
-                                file=DOWNLOAD_DIR,
-                                progress_callback=fast_progress
-                            )
+                        nonlocal last_pct
 
-                            if file_path:
-                                story_date = getattr(story, 'date', None)
-                                if not story_date and hasattr(story, 'media') and hasattr(story.media, 'date'):
-                                    story_date = story.media.date
+                        if total <= 0:
+                            return
 
-                                if story_date:
-                                    if story_date.tzinfo is None:
-                                        story_date = story_date.replace(tzinfo=ZoneInfo("UTC"))
-                                    baghdad_time = story_date.astimezone(ZoneInfo("Asia/Baghdad"))
-                                    formatted_date = baghdad_time.strftime("%Y-%m-%d | %I:%M:%S %p")
-                                else:
-                                    baghdad_time = datetime.now(ZoneInfo("Asia/Baghdad"))
-                                    formatted_date = baghdad_time.strftime("%Y-%m-%d | %I:%M:%S %p")
+                        pct = int(
+                            current / total * 100
+                        )
 
-                                caption = f"{label} لـ: {target_name}\n⏱️ وقت النشر الأصلي: {formatted_date}"
-                                
-                                await client.send_file(destination, file_path, caption=caption)
-                                success_count += 1
-                                if os.path.exists(file_path):
-                                    os.remove(file_path)
-                    except Exception as e:
-                        print(f"خطأ أثناء تحميل قصة: {e}")
+                        if (
+                            pct >= last_pct + 25
+                            or pct == 100
+                        ):
 
-            try:
-                await counter_msg.delete()
-            except Exception:
-                pass
+                            last_pct = pct
 
-            await client.send_message(chat_id, f"✅ تم الانتهاء بنجاح! تم تحميل وإرسال ({success_count} / {total_count}) قصة إلى {dest_name}.")
-            del pending_stories[chat_id]
+                            try:
 
-@client.on(events.NewMessage(incoming=True))
+                                await counter_msg.edit(
+                                    f"📥 **جاري التحميل...**\n\n"
+
+                                    f"📌 القصة: "
+                                    f"{current_index} / {total_count}\n"
+                f"📊 التقدم: "
+                f"`{pct}%`\n"
+                f"📂 الوجهة: "
+                f"{dest_name}"
+            )
+
+        except Exception:
+            pass
+
+
+    # =====================================================
+    # إنهاء التحميل
+    # =====================================================
+
+    try:
+        await counter_msg.delete()
+    except Exception:
+        pass
+
+
+    await client.send_message(
+        chat_id,
+
+        f"✅ **اكتمل التحميل!**\n\n"
+        f"📥 تم تحميل: "
+        f"**{success_count} / {total_count}**\n"
+        f"📂 الوجهة: "
+        f"**{dest_name}**"
+    )
+
+
+    pending_stories.pop(
+        chat_id,
+        None
+    )
+
+
+# =========================================================
+# الرسائل الواردة
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        incoming=True
+    )
+)
 async def handle_incoming_messages(event):
+
     if not event.is_private:
         return
-    
+
     sender_id = event.sender_id
+
+    # المحظور
     if sender_id in banned_users:
-        client.loop.create_task(event.delete())
+
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
         return
 
     sender = await event.get_sender()
-    username = f"@{sender.username}" if sender and sender.username else "لا يوجد معرف"
-    current_time = datetime.now(ZoneInfo("Asia/Baghdad")).strftime("%Y-%m-%d | %I:%M:%S %p")
 
+    username = (
+        f"@{sender.username}"
+        if sender and sender.username
+        else "لا يوجد معرف"
+    )
+
+    current_time = datetime.now(
+        ZoneInfo("Asia/Baghdad")
+    ).strftime(
+        "%Y-%m-%d | %I:%M:%S %p"
+    )
+
+    # أول تفاعل
     if sender_id not in visited_users_cache:
-        visited_users_cache.add(sender_id)
+
+        visited_users_cache.add(
+            sender_id
+        )
+
         try:
+
             visit_msg = (
-                f"👀 **تم رصد تفاعل/دخول جديد للمحادثة:**\n\n"
+                f"👀 **تم رصد تفاعل جديد:**\n\n"
                 f"👤 **المعرف:** {username}\n"
                 f"🆔 **الآيدي:** `{sender_id}`\n"
                 f"⏱️ **الوقت:** {current_time}"
             )
-            await client.send_message('me', visit_msg)
+
+            await client.send_message(
+                "me",
+                visit_msg
+            )
+
         except Exception as e:
-            print(f"خطأ: {e}")
+
+            print(
+                f"خطأ: {e}"
+            )
 
     message_info_cache[event.id] = {
+
         "sender_id": sender_id,
+
         "username": username,
+
         "text": event.message.text or ""
     }
 
+    # الميديا
     if event.media:
-        media_cache[(sender_id, event.id)] = event.message
+
+        media_cache[
+            (sender_id, event.id)
+        ] = event.message
+
         clean_caches()
+
+        # الحفظ التلقائي
         if sender_id in auto_save_users:
+
             try:
-                file_path = await client.download_media(event.message, file=DOWNLOAD_DIR)
+
+                file_path = await client.download_media(
+                    event.message,
+                    file=DOWNLOAD_DIR
+                )
+
                 if file_path:
-                    current_time = datetime.now(ZoneInfo("Asia/Baghdad")).strftime("%Y-%m-%d | %I:%M:%S %p")
-                    await client.send_file('me', file_path, caption=f"📥 [حفظ تلقائي]\n👤 المعرف: {username}\n🆔 الآيدي: `{sender_id}`\n⏱️ الوقت: {current_time}")
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-            except Exception as e:
-                print(f"خطأ: {e}")
 
-@client.on(events.MessageEdited(incoming=True))
-async def handle_edited_messages(event):
-    if not event.is_private:
-        return
-    msg_id = event.id
-    new_text = event.message.text or "[ميديا أو محتوى فارغ]"
-    current_time = datetime.now(ZoneInfo("Asia/Baghdad")).strftime("%Y-%m-%d | %I:%M:%S %p")
-    if msg_id in message_info_cache:
-        info = message_info_cache[msg_id]
-        if info["text"] != new_text:
-            try:
-                log_msg = (
-                    f"✏️ **تم رصد رسالة مُعدلة:**\n\n"
-                    f"👤 **المعرف:** {info['username']}\n"
-                    f"🆔 **الآيدي:** `{info['sender_id']}`\n"
-                    f"⏱️ **الوقت:** {current_time}\n\n"
-                    f"📌 **قبل التعديل:**\n{info['text']}\n\n"
-                    f"📝 **بعد التعديل:**\n{new_text}"
-                )
-                await client.send_message('me', log_msg)
-            except Exception as e:
-                print(f"خطأ: {e}")
-        message_info_cache[msg_id]["text"] = new_text
+                    await client.send_file(
 
-@client.on(events.MessageDeleted)
-async def handle_deleted_messages(event):
-    current_time = datetime.now(ZoneInfo("Asia/Baghdad")).strftime("%Y-%m-%d | %I:%M:%S %p")
-    for msg_id in event.deleted_ids:
-        if msg_id in message_info_cache:
-            info = message_info_cache[msg_id]
-            try:
-                log_msg = (
-                    f"🗑️ **تم حذف رسالة نصية:**\n\n"
-                    f"👤 **المعرف:** {info['username']}\n"
-                    f"🆔 **الآيدي:** `{info['sender_id']}`\n"
-                    f"⏱️ **الوقت:** {current_time}\n\n"
-                    f"💬 **النص المحذوف:**\n{info['text']}"
-                )
-                await client.send_message('me', log_msg)
-            except Exception as e:
-                print(f"خطأ: {e}")
-            finally:
-                del message_info_cache[msg_id]
+                        "me",
 
-        for cache_key, msg_obj in list(media_cache.items()):
-            if cache_key[1] == msg_id:
-                sender_id = cache_key[0]
-                username = message_info_cache.get(msg_id, {}).get("username", "غير متوفر")
-                try:
-                    file_path = await client.download_media(msg_obj, file=DOWNLOAD_DIR)
-                    if file_path:
-                        caption = (
-                            f"🗑️ **تم استخراج وسائط بعد حذفها!**\n\n"
-                            f"👤 **المعرف:** {username}\n"
-                            f"🆔 **الآيدي:** `{sender_id}`\n"
-                            f"⏱️ **الوقت:** {current_time}"
+                        file_path,
+
+                        caption=(
+                            f"📥 **[حفظ تلقائي]**\n\n"
+                            f"👤 المعرف: {username}\n"
+                            f"🆔 الآيدي: `{sender_id}`\n"
+                            f"⏱️ الوقت: {current_time}"
                         )
-                        await client.send_file('me', file_path, caption=caption)
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                except Exception as e:
-                    print(f"خطأ: {e}")
-                finally:
-                    del media_cache[cache_key]
-                break
+                    )
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^(7|8)$'))
-async def handle_media_download_commands(event):
+                    if os.path.exists(
+                        file_path
+                    ):
+
+                        os.remove(
+                            file_path
+                        )
+
+            except Exception as e:
+
+                print(
+                    f"خطأ في الحفظ التلقائي: {e}"
+                )
+
+
+# =========================================================
+# تعديل الرسائل
+# =========================================================
+
+@client.on(
+    events.MessageEdited(
+        incoming=True
+    )
+)
+async def handle_edited_messages(event):
+
     if not event.is_private:
         return
+
+    msg_id = event.id
+
+    new_text = (
+        event.message.text
+        or "[ميديا أو محتوى فارغ]"
+    )
+
+    current_time = datetime.now(
+        ZoneInfo("Asia/Baghdad")
+    ).strftime(
+        "%Y-%m-%d | %I:%M:%S %p"
+    )
+
+    if msg_id not in message_info_cache:
+        return
+
+    info = message_info_cache[
+        msg_id
+    ]
+
+    if info["text"] != new_text:
+
+        try:
+
+            log_msg = (
+                f"✏️ **تم رصد رسالة معدلة:**\n\n"
+                f"👤 **المعرف:** "
+                f"{info['username']}\n"
+                f"🆔 **الآيدي:** "
+                f"`{info['sender_id']}`\n"
+                f"⏱️ **الوقت:** "
+                f"{current_time}\n\n"
+                f"📌 **قبل التعديل:**\n"
+                f"{info['text']}\n\n"
+                f"📝 **بعد التعديل:**\n"
+                f"{new_text}"
+            )
+
+            await client.send_message(
+                "me",
+                log_msg
+            )
+
+        except Exception as e:
+
+            print(
+                f"خطأ: {e}"
+            )
+
+    message_info_cache[
+        msg_id
+    ]["text"] = new_text
+
+
+# =========================================================
+# الرسائل المحذوفة
+# =========================================================
+
+@client.on(
+    events.MessageDeleted
+)
+async def handle_deleted_messages(event):
+
+    current_time = datetime.now(
+        ZoneInfo("Asia/Baghdad")
+    ).strftime(
+        "%Y-%m-%d | %I:%M:%S %p"
+    )
+
+    for msg_id in event.deleted_ids:
+
+        info = message_info_cache.get(
+            msg_id
+        )
+
+        # الرسائل النصية
+        if info:
+
+            try:
+
+                log_msg = (
+                    f"🗑️ **تم حذف رسالة:**\n\n"
+                    f"👤 **المعرف:** "
+                    f"{info['username']}\n"
+                    f"🆔 **الآيدي:** "
+                    f"`{info['sender_id']}`\n"
+                    f"⏱️ **الوقت:** "
+                    f"{current_time}\n\n"
+                    f"💬 **النص:**\n"
+                    f"{info['text']}"
+                )
+
+                await client.send_message(
+                    "me",
+                    log_msg
+                )
+
+            except Exception as e:
+
+                print(
+                    f"خطأ: {e}"
+                )
+
+        # الميديا المحذوفة
+        for cache_key, msg_obj in list(
+            media_cache.items()
+        ):
+
+            if cache_key[1] != msg_id:
+                continue
+
+            sender_id = cache_key[0]
+
+            username = (
+                info["username"]
+                if info
+                else "غير متوفر"
+            )
+
+            try:
+
+                file_path = await client.download_media(
+                    msg_obj,
+                    file=DOWNLOAD_DIR
+                )
+
+                if file_path:
+
+                    caption = (
+                        f"🗑️ **تم رصد ميديا محذوفة**\n\n"
+                        f"👤 **المعرف:** "
+                        f"{username}\n"
+                        f"🆔 **الآيدي:** "
+                        f"`{sender_id}`\n"
+                        f"⏱️ **الوقت:** "
+                        f"{current_time}"
+                    )
+
+                    await client.send_file(
+                        "me",
+                        file_path,
+                        caption=caption
+                    )
+
+                    if os.path.exists(
+                        file_path
+                    ):
+
+                        os.remove(
+                            file_path
+                        )
+
+            except Exception as e:
+
+                print(
+                    f"خطأ في الميديا المحذوفة: {e}"
+                )
+
+            finally:
+
+                del media_cache[
+                    cache_key
+                ]
+
+            break
+
+        if msg_id in message_info_cache:
+
+            del message_info_cache[
+                msg_id
+            ]
+
+
+# =========================================================
+# 7 / 8 لتحميل الميديا
+# =========================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^(7|8)$"
+    )
+)
+async def handle_media_download_commands(event):
+
+    if not event.is_private:
+        return
+
     reply_msg = await event.get_reply_message()
+
     if not reply_msg:
         return
+
     sender_id = reply_msg.sender_id
+
     command = event.raw_text.strip()
-    target_message = media_cache.get((sender_id, reply_msg.id)) or (reply_msg if reply_msg.media else None)
-    if not target_message or not target_message.media:
-        client.loop.create_task(event.delete())
+
+    target_message = (
+        media_cache.get(
+            (sender_id, reply_msg.id)
+        )
+        or (
+            reply_msg
+            if reply_msg.media
+            else None
+        )
+    )
+
+    if not target_message:
+
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
         return
-    client.loop.create_task(event.delete())
+
     try:
-        file_path = await client.download_media(target_message, file=DOWNLOAD_DIR)
-        if file_path:
-            current_time = datetime.now(ZoneInfo("Asia/Baghdad")).strftime("%Y-%m-%d | %I:%M:%S %p")
-            if command == '7':
-                await client.send_file(event.chat_id, file_path, caption=f"⏱️ الوقت: {current_time}")
-            elif command == '8':
-                await client.send_file('me', file_path, caption=f"⏱️ الوقت: {current_time}")
-            if os.path.exists(file_path):
-                os.remove(file_path)
+        await event.delete()
+    except Exception:
+        pass
+
+    try:
+
+        file_path = await client.download_media(
+            target_message,
+            file=DOWNLOAD_DIR
+        )
+
+        if not file_path:
+            return
+
+        current_time = datetime.now(
+            ZoneInfo("Asia/Baghdad")
+        ).strftime(
+            "%Y-%m-%d | %I:%M:%S %p"
+        )
+
+        if command == "7":
+
+            await client.send_file(
+                event.chat_id,
+                file_path,
+                caption=f"⏱️ الوقت: {current_time}"
+            )
+
+        elif command == "8":
+
+            await client.send_file(
+                "me",
+                file_path,
+                caption=f"⏱️ الوقت: {current_time}"
+            )
+
+        if os.path.exists(
+            file_path
+        ):
+
+            os.remove(
+                file_path
+            )
+
     except Exception as e:
-        print(f"خطأ: {e}")
+
+        print(
+            f"خطأ في تحميل الميديا: {e}"
+        )
+
+
+# =========================================================
+# التشغيل
+# =========================================================
 
 def main():
-    print("جاري تشغيل اليوزر بوت...")
+
+    print(
+        "🚀 جاري تشغيل اليوزر بوت..."
+    )
+
     client.start()
+
+    print(
+        "✅ تم الاتصال بحساب Telegram بنجاح."
+    )
+
     client.run_until_disconnected()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
+             
