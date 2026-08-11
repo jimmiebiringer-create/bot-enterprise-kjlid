@@ -925,57 +925,86 @@ async def handle_user_replies(event):
 
                 current_index += 1
 
-                try:
+            try:
+                if not getattr(story, "media", None):
+                    continue
 
-                    if not getattr(
-                        story,
-                        "media",
-                        None
-                    ):
-                        continue
+                last_pct = -1
 
+                async def progress_callback(current, total):
+                    nonlocal last_pct
 
-                    last_pct = -1
+                    if total <= 0:
+                        return
 
+                    pct = int(current / total * 100)
 
-                    async def progress_callback(
-                        current,
-                        total
-                    ):
+                    if pct >= last_pct + 25 or pct == 100:
+                        last_pct = pct
 
-                        nonlocal last_pct
+                        try:
+                            await counter_msg.edit(
+                                f"📥 **جاري التحميل...**\n\n"
+                                f"📌 القصة: {current_index} / {total_count}\n"
+                                f"📊 التقدم: {pct}%\n"
+                                f"📂 الوجهة: {dest_name}"
+                            )
+                        except Exception:
+                            pass
 
-                        if total <= 0:
-                            return
+                file_path = await client.download_media(
+                    story.media,
+                    file=DOWNLOAD_DIR,
+                    progress_callback=progress_callback
+                )
 
-                        pct = int(
-                            current / total * 100
+                if file_path:
+                    story_date = getattr(story, "date", None)
+
+                    if not story_date and hasattr(story.media, "date"):
+                        story_date = story.media.date
+
+                    if story_date:
+                        if story_date.tzinfo is None:
+                            story_date = story_date.replace(
+                                tzinfo=ZoneInfo("UTC")
+                            )
+
+                        baghdad_time = story_date.astimezone(
+                            ZoneInfo("Asia/Baghdad")
                         )
 
-                        if (
-                            pct >= last_pct + 25
-                            or pct == 100
-                        ):
+                        formatted_date = baghdad_time.strftime(
+                            "%Y-%m-%d | %I:%M:%S %p"
+                        )
+                    else:
+                        baghdad_time = datetime.now(
+                            ZoneInfo("Asia/Baghdad")
+                        )
 
-                            last_pct = pct
+                        formatted_date = baghdad_time.strftime(
+                            "%Y-%m-%d | %I:%M:%S %p"
+                        )
 
-                            try:
+                    caption = (
+                        f"{label} لـ: {target_name}\n"
+                        f"⏱️ وقت النشر الأصلي: {formatted_date}"
+                    )
 
-                                await counter_msg.edit(
-                                    f"📥 **جاري التحميل...**\n\n"
+                    await client.send_file(
+                        destination,
+                        file_path,
+                        caption=caption
+                    )
 
-                                    f"📌 القصة: "
-                                    f"{current_index} / {total_count}\n"
-                f"📊 التقدم: "
-                f"`{pct}%`\n"
-                f"📂 الوجهة: "
-                f"{dest_name}"
-            )
+                    success_count += 1
 
-        except Exception:
-            pass
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
 
-
+            except Exception as e:
+                print(f"خطأ أثناء تحميل قصة: {e}")
+    
     # =====================================================
     # إنهاء التحميل
     # =====================================================
