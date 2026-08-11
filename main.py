@@ -17,7 +17,7 @@ from telethon.tl.functions.stories import (
 # =========================================================
 
 API_ID = int(os.getenv("API_ID", "32492582"))
-API_HASH = os.getenv("d7737a28a39c86f3bb82777d0a1aea6e")
+API_HASH = os.getenv("API_HASH")
 
 SESSION = os.getenv("SESSION")
 
