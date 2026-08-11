@@ -3,12 +3,21 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telethon import TelegramClient, events
-from telethon.tl.functions.stories import GetPeerStoriesRequest, GetPinnedStoriesRequest
+from telethon.sessions import StringSession
 
 API_ID = 32492582
-API_HASH ="d7737a28a39c86f3bb82777d0a1aea6e"
+API_HASH = "..."
 
-client = TelegramClient('my_account', API_ID, API_HASH)
+SESSION = os.getenv("SESSION")
+
+if not SESSION:
+    raise RuntimeError("SESSION غير موجود في Railway Variables")
+
+client = TelegramClient(
+    StringSession(SESSION),
+    API_ID,
+    API_HASH
+)
 
 BANNED_FILE = "banned.json"
 auto_save_users = set()
